@@ -1,0 +1,664 @@
+/*
+ * multilink.c - support routines for multilink.
+ *
+ * Copyright (c) 2000-2002 Paul Mackerras. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. The name(s) of the authors of this software must not be used to
+ *    endorse or promote products derived from this software without
+ *    prior written permission.
+ *
+ * 3. Redistributions of any form whatsoever must retain the following
+ *    acknowledgment:
+ *    "This product includes software developed by Paul Mackerras
+ *     <paulus@samba.org>".
+ *
+ * THE AUTHORS OF THIS SOFTWARE DISCLAIM ALL WARRANTIES WITH REGARD TO
+ * THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS, IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY
+ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <netdb.h>
+#include <errno.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+#include "pppd.h"
+#include "fsm.h"
+#include "lcp.h"
+#include "tdb.h"
+#include "ppp_remark.h"
+#include "pppd_debug.h"
+#include "ipcp.h"
+
+bool endpoint_specified;	/* user gave explicit endpoint discriminator */
+char *bundle_id;		/* identifier for our bundle */
+char *blinks_id;		/* key for the list of links */
+bool doing_multilink;		/* multilink was enabled and agreed to */
+bool multilink_master;		/* we own the multilink bundle */
+
+extern TDB_CONTEXT *pppdb;
+extern char db_key[];
+
+static void make_bundle_links __P((int append, int unit));
+static void remove_bundle_link __P((int));
+static void iterate_bundle_links __P((void (*func) __P((char *)), int));
+
+int get_default_epdisc __P((struct epdisc *));
+static int parse_num __P((char *str, const char *key, int *valp));
+static int owns_unit __P((TDB_DATA pid, int unit));
+
+#define set_ip_epdisc(ep, addr) do {	\
+	ep->length = 4;			\
+	ep->value[0] = addr >> 24;	\
+	ep->value[1] = addr >> 16;	\
+	ep->value[2] = addr >> 8;	\
+	ep->value[3] = addr;		\
+} while (0)
+
+#define LOCAL_IP_ADDR(addr)						  \
+	(((addr) & 0xff000000) == 0x0a000000		/* 10.x.x.x */	  \
+	 || ((addr) & 0xfff00000) == 0xac100000		/* 172.16.x.x */  \
+	 || ((addr) & 0xffff0000) == 0xc0a80000)	/* 192.168.x.x */
+
+#define process_exists(n)	(kill((n), 0) == 0 || errno != ESRCH)
+
+void
+mp_check_options(int unit)
+{
+    lcp_options *wo = GET_LCP_WANT_OPT(unit);
+    lcp_options *ao = GET_LCP_ALLOW_OPT(unit);
+    struct ppp_interface *pif = ppp_if[unit];
+
+    ZLOG_INFO("unit:%u, pif->multilink_flags:%u", unit, pif->multilink_flags);
+	if(pif->multilink_flags == 0)
+		return;
+	/* if we're doing multilink, we have to negotiate MRRU */
+	if (!wo->neg_mrru) {
+		/* mrru not specified, default to mru */
+		wo->mrru = wo->mru;
+		wo->neg_mrru = 1;
+	}
+	ao->mrru = ao->mru;
+	ao->neg_mrru = 1;
+
+	if (!wo->neg_endpoint) {
+		/* get a default endpoint value */
+		wo->neg_endpoint = get_default_epdisc(&wo->endpoint);
+	}
+}
+
+/*
+ * Make a new bundle or join us to an existing bundle
+ * if we are doing multilink.
+ */
+
+/* 如果是master执行该函数返回0，如果是slave执行该函数attach到主返回1 */
+int mp_join_bundle(int unit, int is_do_bundle)
+{
+	lcp_options *go = GET_LCP_GOTO_OPT(unit);
+	lcp_options *ho = GET_LCP_HIS_OPT(unit);
+	lcp_options *ao = GET_LCP_ALLOW_OPT(unit);
+	struct ppp_interface *pif = ppp_if[unit];
+	struct ppp_interface *master_if;
+	//int have_master = 0;
+	int mtu;
+
+	if (!go->neg_mrru || !ho->neg_mrru) {
+		/* not doing multilink */
+		if (go->neg_mrru)
+			PPPD_DEBUG_NEGTIAT("oops, multilink negotiated only for receive");
+		mtu = ho->neg_mru? ho->mru: PPP_MRU;
+		if (mtu > ao->mru)
+			mtu = ao->mru;
+
+		make_new_bundle(unit, 0, 0, 0, 0);
+		//set_ifunit(unit, 1);
+		netif_set_mtu(unit, mtu);
+		return 0;
+	}
+
+    pif->doing_multilink = 1;
+	mtu = MIN(ho->mrru, ao->mru);
+
+    master_if = ppp_if_exist_mp_mater(pif->mp_ifindex);
+    if(master_if != NULL)  {
+	    if(master_if->is_ipcp_up == 0) {
+	        PPPD_DEBUG_NEGTIAT("unit:%u wait to attach to master, unit:%u", unit, master_if->unit);
+	        return 1; /* 绑定操作在主IPCP协商成功后，从的认证LCP和认证成功后才绑定上去,见ppp_connect_allsalve_to_master */
+	    }    
+	    
+		if (bundle_attach(unit, master_if->unit)) {
+			pif->is_master = 0;
+			pif->attach_to_unit = master_if->unit;
+			ppp_remark_interface_addto_multilink(unit, pif->mp_ifindex);
+			
+			PPPD_DEBUG_NEGTIAT("unit:%u Link attached to ppp%u", unit, master_if->unit);
+			return 1; //return 1，在外层就不需要IPCP协商，
+		}
+
+		return 1;
+	}
+
+	make_new_bundle(unit, go->mrru, ho->mrru, go->neg_ssnhf, ho->neg_ssnhf);
+	netif_set_mtu(unit, mtu);
+	ppp_remark_interface_addto_multilink(unit, pif->mp_ifindex);
+	pif->is_master = 1; /* 谁先认证成功谁就是主 */
+
+	PPPD_DEBUG_NEGTIAT("unit:%u is master, Using interface ppp%d", unit, unit);
+	return 0;//return 0，在外层就需要IPCP协商，
+}
+
+void mp_choice_other_master(int unit)
+{
+	struct ppp_interface *pif = ppp_if[unit];
+	struct ppp_interface *master_if;
+    int mul_group = -1;
+    int first_unit = -1;
+    int master_unit = -1;
+    int i;
+
+    if(pif->multilink_flags != 1)
+        return;
+        
+    pif->is_master = 0;
+    mul_group = pif->mp_ifindex;
+    for(i = 0; i < NUM_PPP; i++) {
+        pif = ppp_if[i];
+        if(pif == NULL)
+            continue;
+
+        if(pif->multilink_flags != 1 || pif->mp_ifindex != mul_group)// || i == unit)
+            continue;
+
+        if(pif->phase != PHASE_NETWORK)
+            continue;
+            
+        if(first_unit == -1)  //找到的第一个属于该group的unit  因为有可能unit为组中的最后一个加入到group的，所以需要循环回来选择第一个
+            first_unit = i;
+
+        if(i > unit) {  //找到的第一个属于该group的unit 
+            master_unit = i;
+            break;
+        }
+    }
+
+    if(first_unit == -1) 
+        return;
+        
+    if(master_unit == -1)
+        master_unit = first_unit;
+
+    if(master_unit < 0 || master_unit > NUM_PPP) {
+        PPPD_DEBUG_NEGTIAT("choice master unit :%u error", master_unit);
+        return;
+    }
+    master_if = ppp_if[master_unit];
+    master_if->is_master = 1;
+
+    for(i = 0; i < NUM_PPP; i++) {
+        pif = ppp_if[i];
+        if(pif == NULL)
+            continue;
+
+        if(pif->multilink_flags != 1 || pif->mp_ifindex != mul_group)// || i == unit)
+            continue;
+
+        if(pif->phase != PHASE_NETWORK)
+            continue;
+            
+        if(i == master_unit)
+            continue;
+
+        pif->is_master = 0;
+    }
+    ipcp_open(master_unit);
+	PPPD_DEBUG_NEGTIAT("multlink group:%u, unit:%u to bo master, begin to ipcp", mul_group, master_unit);
+}
+
+int ppp_connect_allsalve_to_master(unsigned int master_unit)
+{
+    int i;
+    struct ppp_interface *pif;
+    unsigned int group;
+
+    pif = ppp_if[master_unit];
+    group = pif->mp_ifindex;
+    if(group == 0 || pif->multilink_flags == 0)
+        return 0;
+    
+    for(i = 0; i < NUM_PPP; i++) {
+        pif = ppp_if[i];
+        if(pif->mp_ifindex != group || pif->is_master == 1 || pif->auth_ok == 0 || pif->enable == 0)
+            continue;
+
+        mp_join_bundle(pif->unit, 1);
+    }
+
+    return 1;
+}
+
+//注意mp_bundle_terminated
+void mp_exit_bundle(int unit) //iterate_bundle_links
+{
+	lock_db();
+	remove_bundle_link(unit);
+	unlock_db();
+}
+
+static void sendhup(char *str)
+{
+	int pid;
+
+	if (parse_num(str, "PPPD_PID=", &pid) && pid != getpid()) {
+		if (debug)
+			dbglog("sending SIGHUP to process %d", pid);
+		kill(pid, SIGHUP);
+	}
+}
+
+void mp_master_close_allsalve_lcp(int unit)
+{
+    struct ppp_interface *pif = ppp_if[unit];
+    struct multilink_if_info* group_info;
+    int i;
+    char buf[100];
+
+    if (!pif->multilink_flags || !pif->is_master)
+        return;
+    
+    if (pif->mp_ifindex && pif->is_master == 1) {
+        group_info = ppp_remark_lookup_multilink_interface(pif->mp_ifindex);
+        if(group_info == NULL) {
+            ZLOG_INFO("mp ifindex:%u not exist, unit:%u", pif->mp_ifindex, unit);
+            return;
+        }
+
+        ZLOG_INFO("mp master close all slave lcp, ifindex:0X%x , unit:%u\n", group_info->interface_bit, unit);
+        for(i = 0; i < NUM_PPP; i++) {
+            if(PPP_MULTI_BIT_IS_ZERO(group_info->interface_bit, i))
+                continue;
+
+            if(unit == i)
+                continue; /* 避免master死循环 */
+
+            snprintf(buf, sizeof(buf), "mp close, channel:%u", i);
+            lcp_close(i, buf);
+        }
+
+        group_info->interface_bit = 0;
+	}
+
+    return;
+}
+
+void mp_reset_endpoint(int mp_unit)
+{
+	lcp_options *go = GET_LCP_GOTO_OPT(mp_unit);
+	lcp_options *ho = GET_LCP_HIS_OPT(mp_unit);
+
+	BZERO(go, sizeof(*go));
+	BZERO(ho, sizeof(*ho));	
+}
+
+//link_terminated和mp_bundle_terminated对应
+void mp_bundle_terminated(int unit)
+{
+	//TDB_DATA key;
+    struct ppp_interface *pif = ppp_if[unit];
+//    struct multilink_if_info* group_info;
+//    int i;
+
+    if (!pif->multilink_flags)
+        return;
+
+    mp_master_close_allsalve_lcp(unit); /* 先lcp_close从设备 */
+    
+    pif->doing_multilink = 0;
+	pif->bundle_terminating = 1;
+	upper_layers_down(unit);
+	notice("Connection bundle terminated.unit:%u", unit);
+	
+	mp_reset_endpoint(unit);
+    new_phase(unit,PHASE_DEAD);
+}
+
+/*
+{
+key(36) = "BUNDLE_LINKS=\22\22/local:78.31.2d.31.31"
+data(11) = "pppd14507;\00"
+}
+*/ //更新或者创建db中的BUNDLE_LINKS信息，如果append为1，更新。如果append为0，创建
+static void make_bundle_links(int append, int unit)
+{
+	TDB_DATA key, rec;
+	char *p;
+	char entry[32];
+	int l;
+    struct ppp_interface *pif = ppp_if[unit];
+    
+	key.dptr = pif->blinks_id;
+	key.dsize = strlen(pif->blinks_id);
+	slprintf(entry, sizeof(entry), "%s;", db_key);
+	p = entry;
+	if (append) {
+		rec = tdb_fetch(pppdb, key);
+		if (rec.dptr != NULL && rec.dsize > 0) {
+			rec.dptr[rec.dsize-1] = 0;
+			if (strstr(rec.dptr, db_key) != NULL) {
+				/* already in there? strange */
+				warn("link entry already exists in tdb"); //如果"BUNDLE=\22paptest\22/local:63.68.61.70.74.65.73.74"已经存在，这里会有这个打印
+				return;
+			}
+			l = rec.dsize + strlen(entry);
+			p = malloc(l);
+			if (p == NULL)
+				novm("bundle link list");
+			slprintf(p, l, "%s%s", rec.dptr, entry);
+		} else {
+			warn("bundle link list not found");
+		}
+		if (rec.dptr != NULL)
+			free(rec.dptr);
+	}
+	rec.dptr = p;
+	rec.dsize = strlen(p) + 1;
+	if (tdb_store(pppdb, key, rec, TDB_REPLACE))
+		error("couldn't %s bundle link list",
+		      append? "update": "create");
+	if (p != entry)
+		free(p);
+}
+
+static void remove_bundle_link(int unit)
+{
+	TDB_DATA key, rec;
+	char entry[32];
+	char *p, *q;
+	int l;
+
+    struct ppp_interface *pif = ppp_if[unit];
+	key.dptr = pif->blinks_id;
+	key.dsize = strlen(pif->blinks_id);
+	slprintf(entry, sizeof(entry), "%s;", db_key);
+
+	rec = tdb_fetch(pppdb, key);
+	if (rec.dptr == NULL || rec.dsize <= 0) {
+		if (rec.dptr != NULL) {
+			free(rec.dptr);
+			rec.dptr = NULL;
+	    }
+		return;
+	}
+	rec.dptr[rec.dsize-1] = 0;
+	p = strstr(rec.dptr, entry);
+	if (p != NULL) {
+		q = p + strlen(entry);
+		l = strlen(q) + 1;
+		memmove(p, q, l);
+		rec.dsize = p - rec.dptr + l;
+		if (tdb_store(pppdb, key, rec, TDB_REPLACE))
+			error("couldn't update bundle link list (removal)");
+	}
+	if (rec.dptr != NULL) {
+		free(rec.dptr);
+		rec.dptr = NULL;
+    }
+}
+
+static void iterate_bundle_links(void (*func)(char *), int unit) //注意和mp_exit_bundle的区别
+{
+	TDB_DATA key, rec, pp;
+	char *p, *q;
+
+    struct ppp_interface *pif = ppp_if[unit];
+	key.dptr = pif->blinks_id;
+	key.dsize = strlen(pif->blinks_id);
+	rec = tdb_fetch(pppdb, key);
+	if (rec.dptr == NULL || rec.dsize <= 0) {
+		error("bundle link list not found (iterating list)");
+		if (rec.dptr != NULL) {
+			free(rec.dptr);
+			rec.dptr = NULL;
+	    }
+		return;
+	}
+	p = rec.dptr;
+	p[rec.dsize-1] = 0;
+	while ((q = strchr(p, ';')) != NULL) {
+		*q = 0;
+		key.dptr = p;
+		key.dsize = q - p;
+		pp = tdb_fetch(pppdb, key);
+		if (pp.dptr != NULL && pp.dsize > 0) {
+			pp.dptr[pp.dsize-1] = 0;
+			func(pp.dptr);
+		}
+		if (rec.dptr != NULL) {
+			free(rec.dptr);
+			rec.dptr = NULL;
+	    }
+		p = q + 1;
+	}
+	if (rec.dptr != NULL) {
+		free(rec.dptr);
+		rec.dptr = NULL;
+    }
+}
+
+static int
+parse_num(str, key, valp)
+     char *str;
+     const char *key;
+     int *valp;
+{
+	char *p, *endp;
+	int i;
+
+	p = strstr(str, key);
+	if (p != 0) {
+		p += strlen(key);
+		i = strtol(p, &endp, 10);
+		if (endp != p && (*endp == 0 || *endp == ';')) {
+			*valp = i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Check whether the pppd identified by `key' still owns ppp unit `unit'.
+ */
+static int
+owns_unit(key, unit)
+     TDB_DATA key;
+     int unit;
+{
+	char ifkey[32];
+	TDB_DATA kd, vd;
+	int ret = 0;
+
+	slprintf(ifkey, sizeof(ifkey), "IFNAME=ppp%d", unit);
+	kd.dptr = ifkey;
+	kd.dsize = strlen(ifkey);
+	vd = tdb_fetch(pppdb, kd);
+	if (vd.dptr != NULL) {
+		ret = vd.dsize == key.dsize
+			&& memcmp(vd.dptr, key.dptr, vd.dsize) == 0;
+		free(vd.dptr);
+	}
+	return ret;
+}
+
+int
+get_default_epdisc(struct epdisc *ep)
+
+{
+	char *p;
+	struct hostent *hp;
+	u_int32_t addr;
+
+	/* First try for an ethernet MAC address */
+	p = get_first_ethernet();
+	if (p != 0 && get_if_hwaddr(ep->value, p) >= 0) {
+		ep->class = EPD_MAC;
+		ep->length = 6;
+		return 1;
+	}
+
+	/* see if our hostname corresponds to a reasonable IP address */
+	hp = gethostbyname(hostname);
+	if (hp != NULL) {
+		addr = *(u_int32_t *)hp->h_addr;
+		if (!bad_ip_adrs(addr)) {
+			addr = ntohl(addr);
+			if (!LOCAL_IP_ADDR(addr)) {
+				ep->class = EPD_IP;
+				set_ip_epdisc(ep, addr);
+				return 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * epdisc_to_str - make a printable string from an endpoint discriminator.
+ */
+
+static char *endp_class_names[] = {
+    "null", "local", "IP", "MAC", "magic", "phone"
+};
+
+char *
+epdisc_to_str(ep)
+     struct epdisc *ep;
+{
+	static char str[MAX_ENDP_LEN*3+8];
+	u_char *p = ep->value;
+	int i, mask = 0;
+	char *q, c, c2;
+
+	if (ep->class == EPD_NULL && ep->length == 0)
+		return "null";
+	if (ep->class == EPD_IP && ep->length == 4) {
+		u_int32_t addr;
+
+		GETLONG(addr, p);
+		slprintf(str, sizeof(str), "IP:%I", htonl(addr));
+		return str;
+	}
+
+	c = ':';
+	c2 = '.';
+	if (ep->class == EPD_MAC && ep->length == 6)
+		c2 = ':';
+	else if (ep->class == EPD_MAGIC && (ep->length % 4) == 0)
+		mask = 3;
+	q = str;
+	if (ep->class <= EPD_PHONENUM)
+		q += slprintf(q, sizeof(str)-1, "%s",
+			      endp_class_names[ep->class]);
+	else
+		q += slprintf(q, sizeof(str)-1, "%d", ep->class);
+	c = ':';
+	for (i = 0; i < ep->length && i < MAX_ENDP_LEN; ++i) {
+		if ((i & mask) == 0) {
+			*q++ = c;
+			c = c2;
+		}
+		q += slprintf(q, str + sizeof(str) - q, "%.2x", ep->value[i]);
+	}
+	return str;
+}
+
+static int hexc_val(int c)
+{
+	if (c >= 'a')
+		return c - 'a' + 10;
+	if (c >= 'A')
+		return c - 'A' + 10;
+	return c - '0';
+}
+
+int
+str_to_epdisc(ep, str)
+     struct epdisc *ep;
+     char *str;
+{
+	int i, l;
+	char *p, *endp;
+
+	for (i = EPD_NULL; i <= EPD_PHONENUM; ++i) {
+		int sl = strlen(endp_class_names[i]);
+		if (strncasecmp(str, endp_class_names[i], sl) == 0) {
+			str += sl;
+			break;
+		}
+	}
+	if (i > EPD_PHONENUM) {
+		/* not a class name, try a decimal class number */
+		i = strtol(str, &endp, 10);
+		if (endp == str)
+			return 0;	/* can't parse class number */
+		str = endp;
+	}
+	ep->class = i;
+	if (*str == 0) {
+		ep->length = 0;
+		return 1;
+	}
+	if (*str != ':' && *str != '.')
+		return 0;
+	++str;
+
+	if (i == EPD_IP) {
+		u_int32_t addr;
+		i = parse_dotted_ip(str, &addr);
+		if (i == 0 || str[i] != 0)
+			return 0;
+		set_ip_epdisc(ep, addr);
+		return 1;
+	}
+	if (i == EPD_MAC && get_if_hwaddr(ep->value, str) >= 0) {
+		ep->length = 6;
+		return 1;
+	}
+
+	p = str;
+	for (l = 0; l < MAX_ENDP_LEN; ++l) {
+		if (*str == 0)
+			break;
+		if (p <= str)
+			for (p = str; isxdigit(*p); ++p)
+				;
+		i = p - str;
+		if (i == 0)
+			return 0;
+		ep->value[l] = hexc_val(*str++);
+		if ((i & 1) == 0)
+			ep->value[l] = (ep->value[l] << 4) + hexc_val(*str++);
+		if (*str == ':' || *str == '.')
+			++str;
+	}
+	if (*str != 0 || (ep->class == EPD_MAC && l != 6))
+		return 0;
+	ep->length = l;
+	return 1;
+}
+

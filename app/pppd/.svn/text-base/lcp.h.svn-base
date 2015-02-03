@@ -1,0 +1,209 @@
+/*
+ * lcp.h - Link Control Protocol definitions.
+ *
+ * Copyright (c) 1984-2000 Carnegie Mellon University. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *
+ * 3. The name "Carnegie Mellon University" must not be used to
+ *    endorse or promote products derived from this software without
+ *    prior written permission. For permission or any legal
+ *    details, please contact
+ *      Office of Technology Transfer
+ *      Carnegie Mellon University
+ *      5000 Forbes Avenue
+ *      Pittsburgh, PA  15213-3890
+ *      (412) 268-4387, fax: (412) 268-7395
+ *      tech-transfer@andrew.cmu.edu
+ *
+ * 4. Redistributions of any form whatsoever must retain the following
+ *    acknowledgment:
+ *    "This product includes software developed by Computing Services
+ *     at Carnegie Mellon University (http://www.cmu.edu/computing/)."
+ *
+ * CARNEGIE MELLON UNIVERSITY DISCLAIMS ALL WARRANTIES WITH REGARD TO
+ * THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS, IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY BE LIABLE
+ * FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * $Id: lcp.h,v 1.20 2004/11/14 22:53:42 carlsonj Exp $
+ */
+
+/*
+ * Options.
+ */
+
+#ifndef __LCP_H__
+#define __LCP_H__
+
+#include "fsm.h"
+#include "pppd.h"
+
+#define CI_VENDOR	0	/* Vendor Specific */
+#define CI_MRU		1	/* Maximum Receive Unit */
+#define CI_ASYNCMAP	2	/* Async Control Character Map */
+#define CI_AUTHTYPE	3	/* Authentication Type */
+#define CI_QUALITY	4	/* Quality Protocol */
+#define CI_MAGICNUMBER	5	/* Magic Number */
+#define CI_PCOMPRESSION	7	/* Protocol Field Compression */
+#define CI_ACCOMPRESSION 8	/* Address/Control Field Compression */
+#define CI_FCSALTERN	9	/* FCS-Alternatives */
+#define CI_SDP		10	/* Self-Describing-Pad */
+#define CI_NUMBERED	11	/* Numbered-Mode */
+#define CI_CALLBACK	13	/* callback */
+#define CI_MRRU		17	/* max reconstructed receive unit; multilink */
+#define CI_SSNHF	18	/* short sequence numbers for multilink */
+#define CI_EPDISC	19	/* endpoint discriminator */
+#define CI_MPPLUS	22	/* Multi-Link-Plus-Procedure */
+#define CI_LDISC	23	/* Link-Discriminator */
+#define CI_LCPAUTH	24	/* LCP Authentication */
+#define CI_COBS		25	/* Consistent Overhead Byte Stuffing */
+#define CI_PREFELIS	26	/* Prefix Elision */
+#define CI_MPHDRFMT	27	/* MP Header Format */
+#define CI_I18N		28	/* Internationalization */
+#define CI_SDL		29	/* Simple Data Link */
+
+/*
+ * LCP-specific packet types (code numbers).
+ *///code代码域ECHOREQ PROTREJ这几个会走到这里  他们和CONFREQ这里面的几个code代码不一样，单独处理。见fsm_input
+#define PROTREJ		8	/* Protocol Reject */
+#define ECHOREQ		9	/* Echo Request */
+#define ECHOREP		10	/* Echo Reply */
+#define DISCREQ		11	/* Discard Request */
+#define IDENTIF		12	/* Identification */
+#define TIMEREM		13	/* Time Remaining */
+
+/* Value used as data for CI_CALLBACK option */
+#define CBCP_OPT	6	/* Use callback control protocol */
+
+/*
+ * The state of options is described by an lcp_options structure.
+ */ //是否需要协商，参考lcp_init
+#define MAX_ENDP_LEN	20	/* maximum length of discriminator value */
+struct epdisc {
+    unsigned char	class;//"null", "local", "IP", "MAC", "magic", "phone"  分别对应0 1 2 3 4 5 
+    unsigned char	length;//为value长度，1.1.1.1暂用四个字节
+    unsigned char	value[MAX_ENDP_LEN]; //每个字节存一个数字，如1.1.1.1则前四个字节内容都是1
+};
+typedef struct lcp_options {
+    u8 passive;	//没操作过，一直为0	/* Don't die if we don't get a response */ //和下面这项都是等待客户端主动发起连接，我们做服务器端的情况，在参数中配置
+    u8 silent;//没操作，一直为0		/* Wait for the other end to start first */
+    u8 restart;		/* Restart vs. exit after close */
+    u8 neg_mru;		/* Negotiate the MRU? */ //默认应该为1  default-mru或者-mru中设置
+    u8 neg_asyncmap;		/* Negotiate the async map? */
+
+    //如果没有设置密码，在auth_reset中会把这个清0
+    u8 neg_upap;		/* Ask for UPAP authentication? */ //配置实现  lcp_init中ao这几个变量默认值被设置为1,也就是如果为服务器端则默认允许对方认证 注意:如果没有获取到密码，会在auth_reset中清0
+    u8 neg_chap;		/* Ask for CHAP authentication? *///配置实现  如果是客户端的情况，则默认需要进行配置，不配做的话这几个认证信息都为0的
+    u8 neg_eap;		/* Ask for EAP authentication? */
+    u8 neg_magicnumber;	/* Ask for magic number? */ //默认为1
+
+    /*
+    该配置选项用于协商PPP协议域的压缩。PPP协议域可以被压缩进一个与原来两字节协议域有明显区别的单字节形态。该配置选项被发送来通知另一端能接收这种压缩的
+    协议域。只有在该配置选项协商后，被压缩的协议域才能被传送。在协商成功后，链路必须具有同时接受双字节和单字节协议域的PPP包的能力，即不区别两者。当发送任何LCP
+    数据包时不允许压缩协议域，这一规则保证LCP包的明确识别。当一个协议域被压缩，数据链路层FCS域在被压缩的帧中计算，而不是最初的未压缩的帧。
+    */
+    u8 neg_pcompression;	/* HDLC Protocol Field Compression? */ //协议域压缩指示  在命令中配置 nopcomp中配置 默认为1
+
+    /*
+    该配置选项用于协商数据链路层地址和控制域的压缩。  由于数据链路层的地址和控制域是常量，所以易于压缩。该配置选项被发送来通知另一端能接收压缩的地址和控制
+    域。如果当ACFC 未被协商时接收到一个压缩了的帧，可以静静的丢弃该帧。当发送任何LCP包时，地址和信息域必须不被压缩。这一规则保证了能明确识别
+    LCP包。当地址和控制域被压缩时，数据链路层FCS域在被压缩的帧中计算，而不是最初的未压缩帧。
+    */
+    u8 neg_accompression;	/* HDLC Address/Control Field Compression? */ //地址控制域压缩指示 noaccomp活-ac中配置  默认为1
+    u8 neg_lqr;		/* Negotiate use of Link Quality Reports */ //没得陪着，应该没什么用
+    u8 neg_cbcp;		/* Negotiate use of CBCP */ //估计没什么用
+    u8 neg_mrru;		/* negotiate multilink MRRU */ //配置multlink则默认为1
+    u8 neg_ssnhf;		/* negotiate short sequence numbers */ //multilink相关，可以在mpshortseq或者nompshortseq中配置  如果协商了本字段，则在分片的时候采用短序列号，可以参考<<多链路PPP捆绑算法研究及改进>>
+    u8 neg_endpoint;		/* negotiate endpoint discriminator(辨别者，鉴别器) */ //multilink相关
+    int  mru;			/* Value of MRU */ //mtu命令设置客户端的，mru设置客户端，两边值必须一致 不过感觉该值没什么用，只要客户端发送的mru大于MINMRU即可
+    int	 mrru;			/* Value of MRRU, and multilink enable */
+    u_char chap_mdtype;		/* which MD types (hashing algorithm) */ //如果配置了该项，则需要chap认证，neg_chap=1 //lcp_wantoptions[0].chap_mdtype在requre_chap 或者+chap中配置
+    u_int32_t asyncmap;		/* Value of async map */ //This  option sets the Async-Control-Character-Map (ACCM) for this end of the link 
+    // 只有在异步链路上，ACCM协商选项才会生效。参考http://www.h3c.com.cn/Service/Document_Center/IP_Security/FW_VPN/F100-C-AI/Configure/Operation_Manual/H3C_SecPath_F100-C-AI_CG-5PW100/02/201211/759335_30005_0.htm#_Ref310931345
+    //配置选项用来通知双方哪些控制字符在发送时需要映射  默认0
+    
+    u_int32_t magicnumber; //在lcp_resetci中*go = *wo; 
+    int  numloops;		/* Number of loops during magic number neg. */
+    u_int32_t lqr_period;	/* Reporting period for LQR 1/100ths second */
+    struct epdisc endpoint;	/* endpoint discriminator */
+} lcp_options;
+
+struct lcp_parameter {
+	fsm lcp_fsm;
+	lcp_options lcp_wantoptions;	/* Options that we want to request */
+	lcp_options lcp_gotoptions;	/* Options that peer ack'd */
+	lcp_options lcp_allowoptions;	/* Options we allow peer to request */
+	lcp_options lcp_hisoptions;	/* Options that we ack'd */
+	int lcp_echo_unack;	/* Number of unanswered echo-requests */
+	int	lcp_echo_max_unack; /* Tolerance to unanswered echo-requests */
+	int lcp_echo_number;	/* ID number of next echo frame */
+	int lcp_echo_timer_running;  /* set if a timer is running */
+	u16 echo_interval;
+};
+
+#define GET_LCP_FSM(UNIT) &((ppp_if[(UNIT)]->lcp).lcp_fsm)
+#define GET_LCP_FSM_STATE(UNIT) ((ppp_if[(UNIT)]->lcp).lcp_fsm.state)
+#define GET_LCP_WANT_OPT(UNIT) &((ppp_if[(UNIT)]->lcp).lcp_wantoptions)
+#define GET_LCP_GOTO_OPT(UNIT) &((ppp_if[(UNIT)]->lcp).lcp_gotoptions)
+#define GET_LCP_ALLOW_OPT(UNIT) &((ppp_if[(UNIT)]->lcp).lcp_allowoptions)
+#define GET_LCP_HIS_OPT(UNIT) &((ppp_if[(UNIT)]->lcp).lcp_hisoptions)
+
+/* 下面这两个结合使用 */
+#define GET_LCP_ECHO_PEND(UNIT) ((ppp_if[(UNIT)]->lcp).lcp_echo_unack)
+#define GET_LCP_ECHO_MAXPEND(UNIT) ((ppp_if[(UNIT)]->lcp).lcp_echo_max_unack)
+
+#define GET_LCP_ECHO_NUM(UNIT) ((ppp_if[(UNIT)]->lcp).lcp_echo_number)
+#define GET_LCP_ECHO_RUN(UNIT) ((ppp_if[(UNIT)]->lcp).lcp_echo_timer_running)
+#define GET_LCP_ECHO_INTERVAL(UNIT) ((ppp_if[(UNIT)]->lcp).echo_interval)
+#define SET_LCP_ECHO_PEND(UNIT, VALUE) (((ppp_if[(UNIT)]->lcp).lcp_echo_unack) = VALUE)
+#define SET_LCP_ECHO_MAXPEND(UNIT, VALUE) (((ppp_if[(UNIT)]->lcp).lcp_echo_max_unack) = VALUE)
+#define SET_LCP_ECHO_NUM(UNIT, VALUE) (((ppp_if[(UNIT)]->lcp).lcp_echo_number) = VALUE)
+#define SET_LCP_ECHO_RUN(UNIT, VALUE) (((ppp_if[(UNIT)]->lcp).lcp_echo_timer_running) = VALUE)
+#define SET_LCP_ECHO_INTERVAL(UNIT, VALUE) (((ppp_if[(UNIT)]->lcp).echo_interval) = VALUE)
+
+#define GET_LCP_FSM_IS_RUNNING(UNIT) (!((GET_LCP_FSM_STATE(UNIT)) == INITIAL \
+										|| (GET_LCP_FSM_STATE(UNIT)) == CLOSED \
+										|| (GET_LCP_FSM_STATE(UNIT)) == STOPPED))
+#define GET_LCP_FSM_IS_OPENED(UNIT) ((GET_LCP_FSM_STATE(UNIT)) == OPENED)	
+
+
+extern fsm lcp_fsm[];
+extern lcp_options lcp_wantoptions[];
+extern lcp_options lcp_gotoptions[];
+extern lcp_options lcp_allowoptions[];
+extern lcp_options lcp_hisoptions[];
+
+#define DEFMRU	1500		/* Try for this */
+#define MINMRU	128		/* No MRUs below this */
+#define MAXMRU	16384		/* Normally limit MRU to this */
+
+void lcp_open __P((int));
+void lcp_close __P((int, char *));
+void lcp_lowerup __P((int));
+void lcp_lowerdown __P((int));
+void lcp_sprotrej __P((int, u_char *, int));	/* send protocol reject */
+
+extern struct protent lcp_protent;
+
+/* Default number of times we receive our magic number from the peer
+   before deciding the link is looped-back. */
+#define DEFLOOPBACKFAIL	10
+void lcp_echo_lowerup (int unit);
+void lcp_echo_lowerdown (int unit);
+
+#endif
+

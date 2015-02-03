@@ -1,0 +1,1 @@
+make CC=mips64-nlm-linux-gcc
